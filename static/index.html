@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Agar.io WS test</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 16px; }
+      #log { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; height: 240px; overflow: auto; }
+      canvas { border: 1px solid #ddd; display: block; margin-top: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>WS test</h1>
+
+    <div>
+      <input id="msg" placeholder="type message..." />
+      <button id="send">Send</button>
+      <button id="ping">Send JSON ping</button>
+    </div>
+
+    <div id="log"></div>
+
+    <canvas id="c" width="600" height="400"></canvas>
+
+    <script>
+      const logEl = document.getElementById("log");
+      const msgEl = document.getElementById("msg");
+
+      function log(line) {
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      const scheme = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${scheme}://${location.host}/ws`);
+
+      ws.addEventListener("open", () => log("✅ ws open"));
+      ws.addEventListener("close", () => log("❌ ws closed"));
+      ws.addEventListener("error", (e) => log("⚠️ ws error"));
+      ws.addEventListener("message", (ev) => log("⬅️ " + ev.data));
+
+      document.getElementById("send").onclick = () => {
+        ws.send(msgEl.value);
+        log("➡️ " + msgEl.value);
+        msgEl.value = "";
+      };
+
+      document.getElementById("ping").onclick = () => {
+        const payload = { type: "ping", t: Date.now() };
+        ws.send(JSON.stringify(payload));
+        log("➡️ " + JSON.stringify(payload));
+      };
+
+      // Tiny “game-ish” input demo (mouse position -> send)
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+
+      let mouse = { x: 300, y: 200 };
+      canvas.addEventListener("mousemove", (e) => {
+        const r = canvas.getBoundingClientRect();
+        mouse.x = e.clientX - r.left;
+        mouse.y = e.clientY - r.top;
+
+        // send input (throttle later)
+        ws.send(JSON.stringify({ type: "input", x: mouse.x, y: mouse.y }));
+      });
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.beginPath();
+        ctx.arc(mouse.x, mouse.y, 18, 0, Math.PI * 2);
+        ctx.fill();
+        requestAnimationFrame(draw);
+      }
+      draw();
+    </script>
+  </body>
+</html>
+
