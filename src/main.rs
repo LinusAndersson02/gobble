@@ -9,34 +9,49 @@ use axum::{
     routing::any,
 };
 use futures_util::{SinkExt, stream::StreamExt};
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
     time,
 };
 use tower_http::services::{ServeDir, ServeFile};
 
+type PlayerId = u64;
+
+enum Cmd {
+    Join {
+        client_tx: mpsc::UnboundedSender<Message>,
+        reply: oneshot::Sender<PlayerId>,
+    },
+    Leave {
+        id: PlayerId,
+    },
+    Input {
+        id: PlayerId,
+        text: String,
+    },
+}
+
 #[derive(Clone)]
 struct AppState {
-    // server -> clients
-    updates: broadcast::Sender<String>,
-    // clients -> server
-    inputs: mpsc::UnboundedSender<String>,
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
+}
+
+struct Player {
+    id: PlayerId,
+    tx: mpsc::UnboundedSender<Message>,
+    // TODO: pos, vel, radius, etc..
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (updates_tx, _) = broadcast::channel::<String>(128);
-    let (inputs_tx, inputs_rx) = mpsc::unbounded_channel::<String>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
-    tokio::spawn(game_loop(updates_tx.clone(), inputs_rx));
+    tokio::spawn(game_loop(cmd_rx));
 
-    let state = AppState {
-        updates: updates_tx,
-        inputs: inputs_tx,
-    };
-
+    let state = AppState { cmd_tx };
+    // set up routes with state
     let app: axum::Router = Router::new()
         .route("/ws", any(ws_handler))
         .route_service("/", ServeFile::new("static/index.html"))
@@ -57,21 +72,30 @@ async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Resp
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let mut updates_rx = state.updates.subscribe();
+    let (mut client_tx, mut client_rx) = mpsc::unbounded_channel::<Message>();
+
+    let (reply_tx, reply_rx) = oneshot::channel::<PlayerId>();
+
+    if state
+        .cmd_tx
+        .send(Cmd::Join {
+            client_tx: client_tx.clone(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    let id = match reply_rx.await {
+        Ok(id) => id,
+        Err(_) => return,
+    };
 
     let write_task = tokio::spawn(async move {
-        loop {
-            match updates_rx.recv().await {
-                Ok(s) => {
-                    if ws_tx.send(Message::Text(s.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // client fell behind so we skip old updates
-                    continue;
-                }
-                Err(_) => break,
+        while let Some(msg) = client_rx.recv().await {
+            if ws_tx.send(msg).await.is_err() {
+                break;
             }
         }
     });
@@ -79,21 +103,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Text(t) => {
-                let _ = state.inputs.send(t.to_string());
+                let _ = state.cmd_tx.send(Cmd::Input {
+                    id,
+                    text: t.to_string(),
+                });
             }
             Message::Close(_) => break,
             _ => {}
         }
     }
 
+    // Inform the game loop that this player left
+    let _ = state.cmd_tx.send(Cmd::Leave { id });
+
     write_task.abort();
 }
 
-async fn game_loop(
-    updates: broadcast::Sender<String>,
-    mut inputs_rx: mpsc::UnboundedReceiver<String>,
-) {
+async fn game_loop(mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
     let mut tick = time::interval(Duration::from_millis(50)); // 20 TPS for now
+
+    let mut next_id: PlayerId = 1;
+    let mut players: HashMap<PlayerId, Player> = HashMap::new();
     let mut counter: u64 = 0;
 
     loop {
@@ -101,15 +131,44 @@ async fn game_loop(
             _ = tick.tick() => {
                 counter += 1;
 
-                // TODO: step physics, collisions, rebuild quadtree, etc.
-                let state_json = format!(r#"{{"type":"tick","n":{}}}"#, counter);
+                // TODO: step physics, collisions, rebuild spatial index, etc.
 
-                let _ = updates.send(state_json);
+                let mut dead = Vec::new();
+                for (id, p) in players.iter() {
+                    let payload = format!(r#"{{"type":"tick","n":{},"you":{}}}"#, counter, id);
+                    if p.tx.send(Message::Text(payload.into())).is_err() {
+                        dead.push(*id);
+                    }
+                }
+                for id in dead {
+                    players.remove(&id);
+                }
             }
 
-            Some(input) = inputs_rx.recv() => {
-                // TODO: parse input, store per-player aim, etc.
-                println!("input: {input}");
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    Cmd::Join { client_tx, reply } => {
+                        let id = next_id;
+                        next_id += 1;
+
+                        players.insert(id, Player { id, tx: client_tx });
+
+                        let _ = reply.send(id);
+
+                        if let Some(p) = players.get(&id) {
+                            let _ = p.tx.send(Message::Text(format!(r#"{{"type":"welcome","id":{}}}"#, id).into()));
+                        }
+                    }
+
+                    Cmd::Leave { id } => {
+                        players.remove(&id);
+                    }
+
+                    Cmd::Input { id, text } => {
+                        // TODO: parse/store input on that player's state (aim, split, etc)
+                        println!("input from {id}: {text}");
+                    }
+                }
             }
         }
     }
